@@ -19,8 +19,10 @@ mod builder;
 mod iterator;
 
 pub use builder::BlockBuilder;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 pub use iterator::BlockIterator;
+
+pub(crate) const SIZEOF_U16: usize = std::mem::size_of::<u16>();
 
 /// A block is the smallest unit of read and caching in LSM tree. It is a collection of sorted key-value pairs.
 pub struct Block {
@@ -32,11 +34,58 @@ impl Block {
     /// Encode the internal data to the data layout illustrated in the course
     /// Note: You may want to recheck if any of the expected field is missing from your output
     pub fn encode(&self) -> Bytes {
-        unimplemented!()
+        // add 2 bytes at the end for the num_entries field (u16)
+        let len = self.data.len() + self.offsets.len() * SIZEOF_U16 + SIZEOF_U16;
+
+        let mut buffer = BytesMut::with_capacity(len);
+
+        // add data section to buffer
+        buffer.put_slice(&self.data);
+
+        // add offset section to buffer
+        for offset in &self.offsets {
+            buffer.put_u16(*offset);
+        }
+
+        // add final u16 to the buffer that specifies the number of entries in this block
+        buffer.put_u16(
+            self.offsets
+                .len()
+                .try_into()
+                .expect("Number of entries should never be larger than u16::MAX 65535"),
+        );
+
+        buffer.freeze()
     }
 
     /// Decode from the data layout, transform the input `data` to a single `Block`
     pub fn decode(data: &[u8]) -> Self {
-        unimplemented!()
+        let idx_n_entries = data.len() - SIZEOF_U16;
+
+        // extract the final field that specifies the number of entries in this block
+        let n_entries: [u8; 2] = data[idx_n_entries..].try_into().unwrap();
+
+        let n_entries: usize = u16::from_be_bytes(n_entries) as usize;
+
+        // compute the start idx of the offset section
+        let idx_offset_section = idx_n_entries - n_entries * SIZEOF_U16;
+
+        let offsets_section = &data[idx_offset_section..idx_n_entries];
+        let data_section = &data[..idx_offset_section];
+
+        let mut offsets_vec: Vec<u16> = Vec::with_capacity(n_entries);
+
+        for i in 0..n_entries {
+            let o: [u8; 2] = offsets_section[i * SIZEOF_U16..i * SIZEOF_U16 + SIZEOF_U16]
+                .try_into()
+                .unwrap();
+            let o: u16 = u16::from_be_bytes(o);
+            offsets_vec.push(o);
+        }
+
+        Block {
+            data: Vec::from(data_section),
+            offsets: offsets_vec,
+        }
     }
 }

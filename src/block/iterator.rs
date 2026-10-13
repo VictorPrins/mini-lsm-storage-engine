@@ -48,44 +48,105 @@ impl BlockIterator {
 
     /// Creates a block iterator and seek to the first entry.
     pub fn create_and_seek_to_first(block: Arc<Block>) -> Self {
-        unimplemented!()
+        let mut iter = Self::new(block);
+        iter.seek_to_first();
+        iter
     }
 
     /// Creates a block iterator and seek to the first key that >= `key`.
     pub fn create_and_seek_to_key(block: Arc<Block>, key: KeySlice) -> Self {
-        unimplemented!()
+        let mut iter = Self::new(block);
+        iter.seek_to_key(key);
+        iter
     }
 
     /// Returns the key of the current entry.
     pub fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        self.key.as_key_slice()
     }
 
     /// Returns the value of the current entry.
     pub fn value(&self) -> &[u8] {
-        unimplemented!()
+        &self.block.data[self.value_range.0..self.value_range.1]
     }
 
     /// Returns true if the iterator is valid.
     /// Note: You may want to make use of `key`
     pub fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.key.is_empty()
     }
 
     /// Seeks to the first key in the block.
     pub fn seek_to_first(&mut self) {
-        unimplemented!()
+        self.seek_to_idx(0);
     }
 
     /// Move to the next key in the block.
     pub fn next(&mut self) {
-        unimplemented!()
+        let num_elements = self.block.offsets.len();
+        if !self.is_valid() || self.idx == num_elements - 1 {
+            // Iterator is not valid or last element of this block has been reached.
+            // Set key to empty value to signify this iterator has been exhausted
+            self.key = KeyVec::new();
+            return;
+        }
+
+        self.seek_to_idx(self.idx + 1);
     }
 
     /// Seek to the first key that >= `key`.
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
-        unimplemented!()
+
+        // binary search to the first entry that has a key that is greater than or equal to the provided key
+        let idx = self
+            .block
+            .offsets
+            .partition_point(|&offset| self.key_at_offset(offset) < key);
+
+        if idx == self.block.offsets.len() {
+            // all keys in this block are less than key.
+            // hence this iterator is exhausted, which we signify by setting key to empty value.
+            self.key = KeyVec::new();
+            return;
+        }
+
+        self.seek_to_idx(idx);
+    }
+
+    fn seek_to_idx(&mut self, idx: usize) {
+        let offset = self.block.offsets[idx] as usize;
+        let mut buf = &self.block.data[offset..];
+
+        // key_len is first 2 bytes
+        let key_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+        buf = &buf[2..];
+
+        // key is next (key_len) bytes
+        let key = &buf[..key_len];
+        buf = &buf[key_len..];
+
+        // val_len is next 2 bytes
+        let val_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+
+        // Set all values on self
+        self.idx = idx;
+        self.key = KeySlice::from_slice(key).to_key_vec();
+
+        let val_start = offset + 2 + key_len + 2;
+        self.value_range = (val_start, val_start + val_len)
+    }
+
+    fn key_at_offset(&self, offset: u16) -> KeySlice<'_> {
+        let data = &self.block.data[offset as usize..];
+
+        // key_len is first 2 bytes
+        let key_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+
+        // key is next (key_len) bytes
+        let key = &data[2..2 + key_len];
+
+        KeySlice::from_slice(key)
     }
 }
