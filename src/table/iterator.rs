@@ -20,7 +20,11 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use super::SsTable;
-use crate::{block::BlockIterator, iterators::StorageIterator, key::KeySlice};
+use crate::{
+    block::BlockIterator,
+    iterators::StorageIterator,
+    key::KeySlice,
+};
 
 /// An iterator over the contents of an SSTable.
 pub struct SsTableIterator {
@@ -51,42 +55,58 @@ impl SsTableIterator {
 
     /// Create a new iterator and seek to the first key-value pair which >= `key`.
     pub fn create_and_seek_to_key(table: Arc<SsTable>, key: KeySlice) -> Result<Self> {
-        let blk_idx = 0;
+        let Some((blk_idx, blk_iter)) = SsTableIterator::locate_key(&table, key)? else {
+            // This SST doesn't contain the key
+            // set blk_idx to an out-of-bounds index. This makes the iterator invalid as per is_valid.
+            let blk_idx = table.block_meta.len();
+            let blk_iter = BlockIterator::construct_phantom_iter();
+            return Ok(Self {
+                table,
+                blk_iter,
+                blk_idx,
+            });
+        };
 
-        // TODO don't seek to first block here. This is unnecessary IO. We can seek to the key directly using the block meta.
-        let blk_iter = BlockIterator::create_and_seek_to_first(table.read_block_cached(blk_idx)?);
-        let mut iter = Self {
+        Ok(Self {
             table,
             blk_iter,
             blk_idx,
-        };
-
-        iter.seek_to_key(key)?;
-
-        Ok(iter)
+        })
     }
 
     /// Seek to the first key-value pair which >= `key`.
     /// Note: You probably want to review the handout for detailed explanation when implementing
     /// this function.
     pub fn seek_to_key(&mut self, key: KeySlice) -> Result<()> {
+        let Some((blk_idx, blk_iter)) = SsTableIterator::locate_key(&self.table, key)? else {
+            // This SST doesn't contain the key
+            // set blk_idx to an out-of-bounds index. This makes the iterator invalid as per is_valid.
+            self.blk_idx = self.table.block_meta.len();
+            return Ok(());
+        };
+
+        self.blk_idx = blk_idx;
+        self.blk_iter = blk_iter;
+
+        Ok(())
+    }
+
+    fn locate_key(table: &SsTable, key: KeySlice) -> Result<Option<(usize, BlockIterator)>> {
         // The first block that has last_key >= key is the block that we need
-        let blk_idx = self
-            .table
+        let blk_idx = table
             .block_meta
             // partition_point requires the predicate be TRUE for the first partition and FALSE for the second partition. Hence invert the condition.
             .partition_point(|blockmeta| blockmeta.last_key.as_key_slice() < key);
-        self.blk_idx = blk_idx;
 
-        if blk_idx == self.table.block_meta.len() {
+        if blk_idx == table.block_meta.len() {
             // This SST doesn't contain the key
-            // set blk_idx is an out-of-bounds index. This makes the iterator invalid as per is_valid.
-            return Ok(());
+            return Ok(None);
         }
 
-        self.blk_iter =
-            BlockIterator::create_and_seek_to_key(self.table.read_block_cached(self.blk_idx)?, key);
-        Ok(())
+        let blk_iter =
+            BlockIterator::create_and_seek_to_key(table.read_block_cached(blk_idx)?, key);
+
+        Ok(Some((blk_idx, blk_iter)))
     }
 }
 

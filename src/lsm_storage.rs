@@ -30,6 +30,7 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::{KeySlice, KeyVec};
@@ -301,14 +302,14 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let state_snapshot = Arc::clone(&self.state.read());
 
         // iterate over all memtable in order from newest to oldest
         for memtable in
             std::iter::once(&state_snapshot.memtable).chain(&state_snapshot.imm_memtables)
         {
-            let val = memtable.get(_key);
+            let val = memtable.get(key);
             if let Some(val) = val {
                 if val.is_empty() {
                     // this key is deleted
@@ -319,8 +320,26 @@ impl LsmStorageInner {
                 }
             }
         }
+        
+        let target_key = KeySlice::from_slice(key);
 
-        // key not found in any memtable
+        for sst_id in &state_snapshot.l0_sstables {            
+            let iter = SsTableIterator::create_and_seek_to_key(
+                Arc::clone(&state_snapshot.sstables[sst_id]),
+                target_key,
+            )?;
+
+            if iter.is_valid() && iter.key() == target_key {
+                if iter.value().is_empty() {
+                    return Ok(None);
+                } else {
+                    return Ok(Some(Bytes::copy_from_slice(iter.value())));
+                }
+            }
+
+        }
+
+        // key not found in any memtable or sst
         Ok(None)
     }
 

@@ -46,6 +46,16 @@ impl BlockIterator {
         }
     }
 
+    pub(crate) fn construct_phantom_iter() -> Self {
+        // Constructs a BlockIterator over a fake, empty Block. 
+        // This can be useful in cases where a BlockIterator is needed purely for typing reasons, but this BlockIterator is invalid from the start.
+        let block = Block {
+            data: Vec::new(),
+            offsets: Vec::new(),
+        };
+        Self::new(Arc::new(block))
+    }
+
     /// Creates a block iterator and seek to the first entry.
     pub fn create_and_seek_to_first(block: Arc<Block>) -> Self {
         let mut iter = Self::new(block);
@@ -98,7 +108,6 @@ impl BlockIterator {
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
-
         // binary search to the first entry that has a key that is greater than or equal to the provided key
         let idx = self
             .block
