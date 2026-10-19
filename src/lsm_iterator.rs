@@ -15,28 +15,57 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use std::ops::{Bound, RangeBounds};
+
 use anyhow::Result;
+use bytes::Bytes;
 
 use crate::{
-    iterators::{StorageIterator, merge_iterator::MergeIterator},
+    iterators::{
+        StorageIterator, merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator,
+    },
     mem_table::MemTableIterator,
+    table::SsTableIterator,
 };
 
 /// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
-type LsmIteratorInner = MergeIterator<MemTableIterator>;
+type LsmIteratorInner =
+    TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
+    end_bound: Bound<Bytes>,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(mut iter: LsmIteratorInner) -> Result<Self> {
+    pub(crate) fn new(mut iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
         // skip all deletions at the start of the iterator
-        while iter.is_valid() && iter.value().is_empty() {
+        while iter.is_valid()
+            && iter.value().is_empty()
+            && LsmIterator::is_within_bounds(&end_bound, iter.key().raw_ref())
+        {
             iter.next()?;
         }
 
-        Ok(Self { inner: iter })
+        Ok(Self {
+            inner: iter,
+            end_bound,
+        })
+    }
+
+    fn is_within_bounds(end_bound: &Bound<Bytes>, key: &[u8]) -> bool {
+        // Checks if the key is falls within [unbounded, end_bound]
+
+        // Note: the implementation of this method would be easier with a simple
+        // match expression on end_bound. But I chose this implementation as it was an educational
+        // challenge to use the trait and type system appropriately for the .contains method.
+
+        // convert the end_bound to a generic over &[u8]
+        let end_bound = end_bound.as_ref().map(|x| x.as_ref());
+        let range = (Bound::<&[u8]>::Unbounded, end_bound);
+
+        // We need fully qualified syntax to call RangeBounds::contains because multiple impls typematch.
+        RangeBounds::<[u8]>::contains(&range, key)
     }
 }
 
@@ -45,6 +74,7 @@ impl StorageIterator for LsmIterator {
 
     fn is_valid(&self) -> bool {
         self.inner.is_valid()
+            && LsmIterator::is_within_bounds(&self.end_bound, self.inner.key().raw_ref())
     }
 
     fn key(&self) -> &[u8] {

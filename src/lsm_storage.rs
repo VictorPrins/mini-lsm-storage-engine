@@ -31,11 +31,13 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::key::{KeySlice, KeyVec};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
 
 // cache key: (sst_id, block_idx)
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
@@ -409,21 +411,43 @@ impl LsmStorageInner {
     /// Create an iterator over a range of keys.
     pub fn scan(
         &self,
-        _lower: Bound<&[u8]>,
-        _upper: Bound<&[u8]>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
         let snapshot = Arc::clone(&self.state.read());
 
-        let mut iters = vec![];
+        let memtable_iters = std::iter::once(&snapshot.memtable)
+            .chain(&snapshot.imm_memtables)
+            .map(|mt| Box::new(mt.scan(lower, upper)))
+            .collect();
 
-        iters.push(Box::new(snapshot.memtable.scan(_lower, _upper)));
+        let start_key = match lower {
+            Bound::Unbounded => KeyVec::new(),
+            Bound::Included(key) => KeySlice::from_slice(key).to_key_vec(),
+            Bound::Excluded(key) => {
+                // in this case we need to set the start key to the bytestring that is exactly 1 step greater than key according to lexicographic ordering
+                // This is the key that has the 0 byte padded. i.e. same prefix, 1 increment greater length.
+                let mut next_key = Vec::from(key);
+                next_key.push(0);
+                KeyVec::from_vec(next_key)
+            }
+        };
 
-        for mt in &snapshot.imm_memtables {
-            iters.push(Box::new(mt.scan(_lower, _upper)));
+        let mut sst_iters = vec![];
+        for sst_id in &snapshot.l0_sstables {
+            sst_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
+                Arc::clone(&snapshot.sstables[sst_id]),
+                start_key.as_key_slice(),
+            )?));
         }
 
+        let memtable_merge_iter = MergeIterator::create(memtable_iters);
+        let sst_merge_iter = MergeIterator::create(sst_iters);
+
+        let upper_bound = upper.map(|x| Bytes::copy_from_slice(x));
         Ok(FusedIterator::new(LsmIterator::new(
-            MergeIterator::create(iters),
+            TwoMergeIterator::create(memtable_merge_iter, sst_merge_iter)?,
+            upper_bound,
         )?))
     }
 }

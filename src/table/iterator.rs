@@ -52,6 +52,8 @@ impl SsTableIterator {
     /// Create a new iterator and seek to the first key-value pair which >= `key`.
     pub fn create_and_seek_to_key(table: Arc<SsTable>, key: KeySlice) -> Result<Self> {
         let blk_idx = 0;
+
+        // TODO don't seek to first block here. This is unnecessary IO. We can seek to the key directly using the block meta.
         let blk_iter = BlockIterator::create_and_seek_to_first(table.read_block_cached(blk_idx)?);
         let mut iter = Self {
             table,
