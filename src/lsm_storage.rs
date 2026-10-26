@@ -16,6 +16,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::collections::HashMap;
+use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,7 +39,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 // cache key: (sst_id, block_idx)
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
@@ -261,6 +262,10 @@ impl LsmStorageInner {
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
+
+        // create the dir if it does not yet exist
+        fs::create_dir_all(path)?;
+
         let state = LsmStorageState::create(&options);
 
         let compaction_controller = match &options.compaction_options {
@@ -320,10 +325,10 @@ impl LsmStorageInner {
                 }
             }
         }
-        
+
         let target_key = KeySlice::from_slice(key);
 
-        for sst_id in &state_snapshot.l0_sstables {            
+        for sst_id in &state_snapshot.l0_sstables {
             let iter = SsTableIterator::create_and_seek_to_key(
                 Arc::clone(&state_snapshot.sstables[sst_id]),
                 target_key,
@@ -336,7 +341,6 @@ impl LsmStorageInner {
                     return Ok(Some(Bytes::copy_from_slice(iter.value())));
                 }
             }
-
         }
 
         // key not found in any memtable or sst
@@ -401,7 +405,7 @@ impl LsmStorageInner {
         // get write access to the state
         let mut state_guard = self.state.write();
 
-        // copy on write: cone the state so we can safely make changes
+        // copy on write: clone the state so we can safely make changes
         let mut snapshot = LsmStorageState::clone(&state_guard);
 
         // create new memtable
@@ -419,7 +423,58 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        // mutate the state:
+        // acquire state lock
+        // the state lock prevents any other structural changes for the whole duration it is held. We hold this lock during IO. However, get()/put() on the current memtable can proceed whilst state_lock is held.
+
+        // acquire read lock to access the state
+        // clone state Arc (snapshot) so we don't interfere with concurrent readers
+        // release read lock
+
+        // check if imm_memtables has entries. If not, return OK
+
+        // clone LsmStorageState so we can mutate it
+        // do the slow work:
+        // pop last MemTable of imm_memtables
+        // convert into sst using ::flush()
+        // build sst (this incurs disk IO)
+        // push sst at index 0 of l0_sstables
+        // add sst to hashmap
+
+        // acquire write lock on state. This lock is exclusive: whilst it is held, no other thread can concurrently read the state.
+        // assign the new version of the state
+        // release write lock
+        // release state_lock
+
+        let struct_change_guard = self.state_lock.lock();
+
+        let state_snapshot = Arc::clone(&self.state.read());
+
+        if state_snapshot.imm_memtables.is_empty() {
+            return Ok(());
+        };
+
+        let mut new_state = LsmStorageState::clone(&state_snapshot);
+
+        let mt_to_flush = new_state.imm_memtables.pop().unwrap();
+
+        let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+        mt_to_flush.flush(&mut sst_builder)?;
+        // build the sst: this incurs IO
+        let sst_id = mt_to_flush.id();
+        let sst = sst_builder.build(
+            sst_id,
+            Some(Arc::clone(&self.block_cache)),
+            &self.path_of_sst(sst_id),
+        )?;
+
+        new_state.l0_sstables.insert(0, sst_id);
+        new_state.sstables.insert(sst_id, Arc::new(sst));
+
+        // Apply the structural change on the state
+        *self.state.write() = Arc::new(new_state);
+
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {

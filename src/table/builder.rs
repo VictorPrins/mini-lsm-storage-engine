@@ -53,6 +53,7 @@ impl SsTableBuilder {
     }
 
     /// Adds a key-value pair to SSTable.
+    /// Keys MUST be supplied in a strictly increasing order! This upholds the core invariant that SSTs (and its constituent blocks) are sorted.
     ///
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
     /// be helpful here)
