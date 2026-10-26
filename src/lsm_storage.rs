@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -175,7 +175,16 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        // Anything sent over the notifier channel triggers the ending of the flush thread.
+        // send() may return an error if the channel is already disconnected. We don't return this error but silence it.
+        let _ = self.flush_notifier.send(());
+        match self.flush_thread.lock().take() {
+            None => Ok(()),
+            Some(joinhandle) => joinhandle
+                // join waits for this thread to finish
+                .join()
+                .map_err(|e| anyhow!("Flush thread panicked.")),
+        }
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
