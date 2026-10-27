@@ -17,9 +17,9 @@
 
 use std::sync::Arc;
 
-use crate::key::{KeySlice, KeyVec};
-
 use super::Block;
+use crate::key::{KeySlice, KeyVec};
+use bytes::Buf;
 
 /// Iterates on a block.
 pub struct BlockIterator {
@@ -37,17 +37,29 @@ pub struct BlockIterator {
 
 impl BlockIterator {
     fn new(block: Arc<Block>) -> Self {
+        let first_key = if block.data.is_empty() {
+            // if this block is empty, then this is a phantom block (see method below)
+            KeyVec::new()
+        } else {
+            // Extract the first key of this block.
+            // first u16 is the len of the first key
+            // the bytes after it are the first key
+            let mut buf: &[u8] = &block.data;
+            let len_of_first_key = buf.get_u16() as usize;
+            KeySlice::from_slice(&buf[..len_of_first_key]).to_key_vec()
+        };
+
         Self {
             block,
             key: KeyVec::new(),
             value_range: (0, 0),
             idx: 0,
-            first_key: KeyVec::new(),
+            first_key,
         }
     }
 
     pub(crate) fn construct_phantom_iter() -> Self {
-        // Constructs a BlockIterator over a fake, empty Block. 
+        // Constructs a BlockIterator over a fake, empty Block.
         // This can be useful in cases where a BlockIterator is needed purely for typing reasons, but this BlockIterator is invalid from the start.
         let block = Block {
             data: Vec::new(),
@@ -109,10 +121,11 @@ impl BlockIterator {
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
         // binary search to the first entry that has a key that is greater than or equal to the provided key
+        let key = key.to_key_vec();
         let idx = self
             .block
             .offsets
-            .partition_point(|&offset| self.key_at_offset(offset) < key);
+            .partition_point(|&offset| self.decode_entry_at_offset(offset).0 < key);
 
         if idx == self.block.offsets.len() {
             // all keys in this block are less than key.
@@ -125,37 +138,31 @@ impl BlockIterator {
     }
 
     fn seek_to_idx(&mut self, idx: usize) {
-        let offset = self.block.offsets[idx] as usize;
-        let mut buf = &self.block.data[offset..];
+        let offset = self.block.offsets[idx];
 
-        // key_len is first 2 bytes
-        let key_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-        buf = &buf[2..];
-
-        // key is next (key_len) bytes
-        let key = &buf[..key_len];
-        buf = &buf[key_len..];
-
-        // val_len is next 2 bytes
-        let val_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+        let (key, value_range) = self.decode_entry_at_offset(offset);
 
         // Set all values on self
+        self.key = key;
         self.idx = idx;
-        self.key = KeySlice::from_slice(key).to_key_vec();
-
-        let val_start = offset + 2 + key_len + 2;
-        self.value_range = (val_start, val_start + val_len)
+        self.value_range = value_range;
     }
 
-    fn key_at_offset(&self, offset: u16) -> KeySlice<'_> {
-        let data = &self.block.data[offset as usize..];
+    fn decode_entry_at_offset(&self, offset: u16) -> (KeyVec, (usize, usize)) {
+        let offset = offset as usize;
+        let mut buf = &self.block.data[offset..];
 
-        // key_len is first 2 bytes
-        let key_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+        let key_prefix_len = buf.get_u16() as usize;
+        let rest_of_key_len = buf.get_u16() as usize;
+        let rest_of_key = &buf[..rest_of_key_len];
+        buf.advance(rest_of_key_len);
+        let val_len = buf.get_u16() as usize;
 
-        // key is next (key_len) bytes
-        let key = &data[2..2 + key_len];
+        let val_start = offset + 6 + rest_of_key_len;
+        let value_range = (val_start, val_start + val_len);
 
-        KeySlice::from_slice(key)
+        let key: Vec<u8> = [&self.first_key.raw_ref()[..key_prefix_len], rest_of_key].concat();
+
+        (KeyVec::from_vec(key), value_range)
     }
 }
