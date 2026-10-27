@@ -337,17 +337,21 @@ impl LsmStorageInner {
 
         let target_key = KeySlice::from_slice(key);
 
+        // hash the key for probing the bloom filter
+        let key_hash = farmhash::fingerprint32(target_key.raw_ref());
+
         for sst_id in &state_snapshot.l0_sstables {
             let sst = &state_snapshot.sstables[sst_id];
 
             // Only proceed if the target key falls within the range of this sst
             if target_key >= sst.first_key().as_key_slice()
                 && target_key <= sst.last_key().as_key_slice()
+                // only check this sst if the key passes the bloom filter
+                && sst.bloom.as_ref().map_or(true, |bloom| {
+                    bloom.may_contain(key_hash)
+                })
             {
-                let iter = SsTableIterator::create_and_seek_to_key(
-                    Arc::clone(sst),
-                    target_key,
-                )?;
+                let iter = SsTableIterator::create_and_seek_to_key(Arc::clone(sst), target_key)?;
 
                 if iter.is_valid() && iter.key() == target_key {
                     if iter.value().is_empty() {

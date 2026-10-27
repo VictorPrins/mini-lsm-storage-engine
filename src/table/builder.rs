@@ -18,12 +18,12 @@
 use std::sync::Arc;
 use std::{path::Path, vec};
 
-use anyhow::Result;
-
 use super::{BlockMeta, SsTable};
 use crate::key::KeyVec;
 use crate::table::FileObject;
+use crate::table::bloom::Bloom;
 use crate::{block::BlockBuilder, key::KeySlice, lsm_storage::BlockCache};
+use anyhow::Result;
 
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
@@ -37,6 +37,7 @@ pub struct SsTableBuilder {
     // contains the meta entries for all completed blocks
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    key_hashes: Vec<u32>,
 }
 
 impl SsTableBuilder {
@@ -49,6 +50,7 @@ impl SsTableBuilder {
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
+            key_hashes: Vec::new(),
         }
     }
 
@@ -63,6 +65,7 @@ impl SsTableBuilder {
             self.complete_current_block();
             // recursively call add. This should never lead to infinite recursion since we have just created a fresh block
             self.add(key, value);
+            return;
         }
 
         if self.first_key.is_empty() {
@@ -71,6 +74,9 @@ impl SsTableBuilder {
 
         // Always set the last key to the most recently added key
         self.last_key = key.raw_ref().to_vec();
+
+        // add the hash of the key, to be used for the Bloom filter
+        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
     }
 
     fn complete_current_block(&mut self) {
@@ -114,11 +120,23 @@ impl SsTableBuilder {
     ) -> Result<SsTable> {
         self.complete_current_block();
 
-        // SST file format: [[block data] [block meta] [meta block offset (u32)]]
+        // SST file format: [[block data] [block meta] [meta block offset (u32)] [bloom filter] [bloom filter offset (u32)]]
         let mut file_data = self.data;
         let meta_block_offset = u32::try_from(file_data.len()).unwrap();
         BlockMeta::encode_block_meta(&self.meta, &mut file_data);
         file_data.extend(meta_block_offset.to_be_bytes());
+
+        let bloom_filter_offset = u32::try_from(file_data.len()).unwrap();
+
+        const FALSE_POSITIVE_RATE: f64 = 0.01;
+
+        let bloom_filter = Bloom::build_from_key_hashes(
+            &self.key_hashes,
+            Bloom::bloom_bits_per_key(self.key_hashes.len(), FALSE_POSITIVE_RATE),
+        );
+
+        bloom_filter.encode(&mut file_data);
+        file_data.extend(bloom_filter_offset.to_be_bytes());
 
         let file = FileObject::create(path.as_ref(), file_data)?;
 
