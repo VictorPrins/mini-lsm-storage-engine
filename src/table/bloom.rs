@@ -76,23 +76,50 @@ impl Bloom {
     }
 
     /// Get bloom filter bits per key from entries count and FPR
+    /// This function computes the optimal number of bits of the filter, given this desired fpr and expected number of entries
+    /// see https://en.wikipedia.org/wiki/Bloom_filter#Optimal_number_of_hash_functions for the formulas
     pub fn bloom_bits_per_key(entries: usize, false_positive_rate: f64) -> usize {
         let size = -(entries as f64) * false_positive_rate.ln() / std::f64::consts::LN_2.powi(2);
+        // size is the optimal number of bits of the filter
+        // This function returns the number of 'bits per entry' (also called 'bits per key') so it divides again by entries
         let locs = (size / (entries as f64)).ceil();
         locs as usize
     }
 
     /// Build bloom filter from key hashes
     pub fn build_from_key_hashes(keys: &[u32], bits_per_key: usize) -> Self {
+        // 'keys' is a list of h_1 of all the keys. So this is actually a misnomer;
+        // keys is not the keys themselves, but rather the first hash of each key
+        // from this first hash we can compute all other hashes of this key
+
+        // 0.69 == ln(2)
+        // k is the optimal number of hash functions, given the number of bits per key (= filter size / entries)
         let k = (bits_per_key as f64 * 0.69) as u32;
         let k = k.clamp(1, 30);
+
+        // compute the optimal filter size
         let nbits = (keys.len() * bits_per_key).max(64);
         let nbytes = nbits.div_ceil(8);
         let nbits = nbytes * 8;
+
+        // initialize the filter with zeros
         let mut filter = BytesMut::with_capacity(nbytes);
         filter.resize(nbytes, 0);
 
-        // TODO: build the bloom filter
+        // Build the Bloom filter for all keys
+        // See the inline comments in may_contain() for an explanation of how we hash keys
+
+        for key in keys {
+            let mut h = *key;
+            let delta = h.rotate_left(15);
+            
+            for _ in 0..k {
+                let bit_idx = (h as usize) % nbits;
+
+                filter.set_bit(bit_idx, true);
+                h = h.wrapping_add(delta);
+            }
+        }
 
         Self {
             filter: filter.freeze(),
@@ -101,15 +128,35 @@ impl Bloom {
     }
 
     /// Check if a bloom filter may contain some data
-    pub fn may_contain(&self, h: u32) -> bool {
+    /// h is the hash of a key
+    pub fn may_contain(&self, mut h: u32) -> bool {
         if self.k > 30 {
             // potential new encoding for short bloom filters
             true
         } else {
             let nbits = self.filter.bit_len();
+
+            // We use the following paper to compute the k hash functions
+            // https://www.eecs.harvard.edu/~michaelm/postscripts/rsa2008.pdf
+            // g_i(x) = h_1(x) + i * h_2(x)
+            // where g_i(x) is the ith hash used for the bloom filter for key x.
+            // in short: we need only two hashes (h_1 and h_2) and then add h_2 repeatedly to arrive at a new hash.
+            // In this code, we compute h_2 (named 'delta') by rotating the bits of h_1. This is a simple way to construct a new hash
+            // from another hash.
             let delta = h.rotate_left(15);
 
-            // TODO: probe the bloom filter
+            for _ in 0..self.k {
+                let bit_idx = (h as usize) % nbits;
+
+                // if we encounter any bit that is not true in the filter, the bloom filter has returned a negative result
+                // hence return false
+                if !self.filter.get_bit(bit_idx) {
+                    return false;
+                }
+
+                // compute the next hash
+                h = h.wrapping_add(delta);
+            }
 
             true
         }
