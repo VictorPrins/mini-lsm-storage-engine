@@ -103,7 +103,6 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     }
 
     fn next(&mut self) -> Result<()> {
-
         // Core invariant: everything in the heap and in current is always valid before and after this function
 
         let cur_iter = &mut self.current.as_mut().unwrap().1;
@@ -154,5 +153,19 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
         }
 
         Ok(())
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        // active iterators in self.iters
+        let count_a: usize = self.iters.iter().map(|x| x.1.num_active_iterators()).sum();
+
+        // active iterators in self.current
+        let count_b = self
+            .current
+            .as_ref()
+            .map(|x| x.1.num_active_iterators())
+            .unwrap_or(0);
+
+        count_a + count_b
     }
 }

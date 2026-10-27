@@ -54,7 +54,7 @@ impl LsmIterator {
     }
 
     fn is_within_bounds(end_bound: &Bound<Bytes>, key: &[u8]) -> bool {
-        // Checks if the key is falls within [unbounded, end_bound]
+        // Checks if the key falls within [unbounded, end_bound]
 
         // Note: the implementation of this method would be easier with a simple
         // match expression on end_bound. But I chose this implementation as it was an educational
@@ -95,6 +95,10 @@ impl StorageIterator for LsmIterator {
         }
 
         Ok(())
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.inner.num_active_iterators()
     }
 }
 
@@ -148,5 +152,9 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         }
 
         Ok(())
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.iter.num_active_iterators()
     }
 }

@@ -338,16 +338,25 @@ impl LsmStorageInner {
         let target_key = KeySlice::from_slice(key);
 
         for sst_id in &state_snapshot.l0_sstables {
-            let iter = SsTableIterator::create_and_seek_to_key(
-                Arc::clone(&state_snapshot.sstables[sst_id]),
-                target_key,
-            )?;
+            let sst = &state_snapshot.sstables[sst_id];
 
-            if iter.is_valid() && iter.key() == target_key {
-                if iter.value().is_empty() {
-                    return Ok(None);
-                } else {
-                    return Ok(Some(Bytes::copy_from_slice(iter.value())));
+            // Only proceed if the target key falls within the range of this sst
+            if target_key >= sst.first_key().as_key_slice()
+                && target_key <= sst.last_key().as_key_slice()
+            {
+                let iter = SsTableIterator::create_and_seek_to_key(
+                    Arc::clone(sst),
+                    target_key,
+                )?;
+
+                if iter.is_valid() && iter.key() == target_key {
+                    if iter.value().is_empty() {
+                        // The value is a deletion tombstone
+                        return Ok(None);
+                    } else {
+                        // Key and value found
+                        return Ok(Some(Bytes::copy_from_slice(iter.value())));
+                    }
                 }
             }
         }
@@ -518,10 +527,16 @@ impl LsmStorageInner {
 
         let mut sst_iters = vec![];
         for sst_id in &snapshot.l0_sstables {
-            sst_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
-                Arc::clone(&snapshot.sstables[sst_id]),
-                start_key.as_key_slice(),
-            )?));
+            let sst = &snapshot.sstables[sst_id];
+            let first_key = sst.first_key().raw_ref();
+            let last_key = sst.last_key().raw_ref();
+
+            if LsmStorageInner::ranges_overlap(lower, upper, first_key, last_key) {
+                sst_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
+                    Arc::clone(sst),
+                    start_key.as_key_slice(),
+                )?));
+            }
         }
 
         let memtable_merge_iter = MergeIterator::create(memtable_iters);
@@ -532,5 +547,31 @@ impl LsmStorageInner {
             TwoMergeIterator::create(memtable_merge_iter, sst_merge_iter)?,
             upper_bound,
         )?))
+    }
+
+    fn ranges_overlap(
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        first_key: &[u8],
+        last_key: &[u8],
+    ) -> bool {
+        // For [first_key, last_key] to overlap a range means that
+        // last_key >= lower bound
+        // AND
+        // first_key <= upper bound
+
+        let lower_bound_satisfied = match lower {
+            Bound::Unbounded => true,
+            Bound::Included(key) => last_key >= key,
+            Bound::Excluded(key) => last_key > key,
+        };
+
+        let upper_bound_satisfied = match upper {
+            Bound::Unbounded => true,
+            Bound::Included(key) => first_key <= key,
+            Bound::Excluded(key) => first_key < key,
+        };
+
+        lower_bound_satisfied && upper_bound_satisfied
     }
 }
