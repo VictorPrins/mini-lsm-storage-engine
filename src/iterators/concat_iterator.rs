@@ -34,12 +34,38 @@ pub struct SstConcatIterator {
 }
 
 impl SstConcatIterator {
+    // The ssts provided must be ordered and non-overlapping
     pub fn create_and_seek_to_first(sstables: Vec<Arc<SsTable>>) -> Result<Self> {
-        unimplemented!()
+        let current = if sstables.is_empty() {
+            None
+        } else {
+            Some(SsTableIterator::create_and_seek_to_first(Arc::clone(
+                &sstables[0],
+            ))?)
+        };
+
+        Ok(SstConcatIterator {
+            current,
+            next_sst_idx: 1,
+            sstables,
+        })
     }
 
     pub fn create_and_seek_to_key(sstables: Vec<Arc<SsTable>>, key: KeySlice) -> Result<Self> {
-        unimplemented!()
+        let current = sstables.partition_point(|x| x.last_key().raw_ref() < key.raw_ref());
+
+        let next_sst_idx = current + 1;
+
+        let current = sstables
+            .get(current)
+            .map(|x| SsTableIterator::create_and_seek_to_key(Arc::clone(x), key))
+            .transpose()?;
+
+        Ok(SstConcatIterator {
+            current,
+            next_sst_idx,
+            sstables,
+        })
     }
 }
 
@@ -47,19 +73,31 @@ impl StorageIterator for SstConcatIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        self.current.as_ref().unwrap().key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.current.as_ref().unwrap().value()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.current.is_some()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        self.current.as_mut().unwrap().next()?;
+
+        if !self.current.as_ref().unwrap().is_valid() {
+            self.current = self
+                .sstables
+                .get(self.next_sst_idx)
+                .map(|sst| SsTableIterator::create_and_seek_to_first(Arc::clone(sst)))
+                .transpose()?;
+            
+            self.next_sst_idx += 1;
+        }
+
+        Ok(())
     }
 
     fn num_active_iterators(&self) -> usize {
