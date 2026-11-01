@@ -24,14 +24,18 @@ use std::time::Duration;
 
 use anyhow::Result;
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
+
 use serde::{Deserialize, Serialize};
 pub use simple_leveled::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, SimpleLeveledCompactionTask,
 };
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
+use crate::iterators::StorageIterator;
+
+use crate::iterators::merge_iterator::MergeIterator;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CompactionTask {
@@ -123,12 +127,118 @@ pub enum CompactionOptions {
 }
 
 impl LsmStorageInner {
-    fn compact(&self, _task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
-        unimplemented!()
+    fn compact(&self, task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
+        // get the SsTable instances
+        // create a mergeiterator over all ssts
+        // iterate over all of them, and build new ssts. Drop tombstones
+        // install the new levels
+
+        let CompactionTask::ForceFullCompaction {
+            l0_sstables,
+            l1_sstables,
+        } = task
+        else {
+            unimplemented!();
+        };
+
+        let state_snapshot = Arc::clone(&self.state.read());
+
+        let iters = l0_sstables
+            .iter()
+            .chain(l1_sstables)
+            .map(|id| {
+                SsTableIterator::create_and_seek_to_first(Arc::clone(&state_snapshot.sstables[id]))
+            })
+            .collect::<Result<Vec<SsTableIterator>>>()?;
+
+        let mut merge_iter = MergeIterator::create(iters.into_iter().map(Box::new).collect());
+
+        let mut new_l1_sstables = Vec::new();
+
+        let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+
+        // use this bool to track if the sst builder contains at least one (non-tombstone) value
+        let mut sst_nonempty = false;
+
+        while merge_iter.is_valid() {
+            // drop tombstones
+            if !merge_iter.value().is_empty() {
+                sst_builder.add(merge_iter.key(), merge_iter.value());
+                sst_nonempty = true;
+            }
+
+            if sst_builder.estimated_size() > self.options.target_sst_size {
+                let sst = self.finish_sst_builder(sst_builder)?;
+                new_l1_sstables.push(Arc::new(sst));
+                sst_builder = SsTableBuilder::new(self.options.block_size);
+                sst_nonempty = false;
+            }
+
+            merge_iter.next()?;
+        }
+
+        if sst_nonempty {
+            // Finish the final builder
+            let sst = self.finish_sst_builder(sst_builder)?;
+            new_l1_sstables.push(Arc::new(sst));
+        }
+
+        {
+            // lock the state for structural changes
+            let _state_guard = self.state_lock.lock();
+            let mut state = LsmStorageState::clone(&self.state.read());
+
+            // remove all l0 table ids that this compaction function moved out of l0. Keep the l0 table ids that were added to l0 since this compaction function started.
+            state.l0_sstables.retain(|id| !l0_sstables.contains(id));
+
+            state.levels[0] = (1, new_l1_sstables.iter().map(|sst| sst.sst_id()).collect());
+
+            for id in l0_sstables.iter().chain(l1_sstables) {
+                state.sstables.remove(id);
+            }
+
+            for sst in &new_l1_sstables {
+                state.sstables.insert(sst.sst_id(), Arc::clone(sst));
+            }
+
+            *self.state.write() = Arc::new(state);
+        }
+
+        for id in l0_sstables.iter().chain(l1_sstables) {
+            std::fs::remove_file(self.path_of_sst(*id))?;
+        }
+
+        Ok(new_l1_sstables)
+    }
+
+    fn finish_sst_builder(&self, sst_builder: SsTableBuilder) -> Result<SsTable> {
+        let id = self.next_sst_id();
+
+        sst_builder.build(
+            id,
+            Some(Arc::clone(&self.block_cache)),
+            self.path_of_sst(id),
+        )
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {
-        unimplemented!()
+        // Important assumption: no two compactions will ever run concurrently. We don't lock to preserve this; we rely on this assumption.
+
+        // take a snapshot of the state
+        // call compact
+
+        let state_snapshot = Arc::clone(&self.state.read());
+
+        let task = CompactionTask::ForceFullCompaction {
+            l0_sstables: state_snapshot.l0_sstables.clone(),
+            l1_sstables: match state_snapshot.levels.get(0) {
+                Some((level, ids)) => ids.clone(),
+                None => Vec::new(),
+            },
+        };
+
+        self.compact(&task)?;
+        Ok(())
     }
 
     fn trigger_compaction(&self) -> Result<()> {
