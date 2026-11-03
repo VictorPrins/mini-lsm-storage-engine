@@ -33,7 +33,9 @@ pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredComp
 
 use crate::iterators::StorageIterator;
 
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
@@ -143,15 +145,27 @@ impl LsmStorageInner {
 
         let state_snapshot = Arc::clone(&self.state.read());
 
-        let iters = l0_sstables
+        // Create individual iterators over the SSTs of L0
+        let l0_sst_iters = l0_sstables
             .iter()
-            .chain(l1_sstables)
             .map(|id| {
                 SsTableIterator::create_and_seek_to_first(Arc::clone(&state_snapshot.sstables[id]))
             })
             .collect::<Result<Vec<SsTableIterator>>>()?;
 
-        let mut merge_iter = MergeIterator::create(iters.into_iter().map(Box::new).collect());
+        // create the iterator that iterates over all of L0
+        let l0_iter = MergeIterator::create(l0_sst_iters.into_iter().map(Box::new).collect());
+
+        // create the iterator that iterates over all of L1
+        let l1_iter = SstConcatIterator::create_and_seek_to_first(
+            l1_sstables
+                .iter()
+                .map(|id| Arc::clone(&state_snapshot.sstables[id]))
+                .collect(),
+        )?;
+
+        // create the iterator that iterates over all of L0 and L1 combined
+        let mut iterator = TwoMergeIterator::create(l0_iter, l1_iter)?;
 
         let mut new_l1_sstables = Vec::new();
 
@@ -160,10 +174,10 @@ impl LsmStorageInner {
         // use this bool to track if the sst builder contains at least one (non-tombstone) value
         let mut sst_nonempty = false;
 
-        while merge_iter.is_valid() {
+        while iterator.is_valid() {
             // drop tombstones
-            if !merge_iter.value().is_empty() {
-                sst_builder.add(merge_iter.key(), merge_iter.value());
+            if !iterator.value().is_empty() {
+                sst_builder.add(iterator.key(), iterator.value());
                 sst_nonempty = true;
             }
 
@@ -174,7 +188,7 @@ impl LsmStorageInner {
                 sst_nonempty = false;
             }
 
-            merge_iter.next()?;
+            iterator.next()?;
         }
 
         if sst_nonempty {

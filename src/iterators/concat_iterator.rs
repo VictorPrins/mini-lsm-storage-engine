@@ -34,7 +34,7 @@ pub struct SstConcatIterator {
 }
 
 impl SstConcatIterator {
-    // The ssts provided must be ordered and non-overlapping
+    // The SSTs provided must be ordered and non-overlapping
     pub fn create_and_seek_to_first(sstables: Vec<Arc<SsTable>>) -> Result<Self> {
         let current = if sstables.is_empty() {
             None

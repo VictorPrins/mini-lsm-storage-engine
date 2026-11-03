@@ -32,6 +32,7 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::StorageIterator;
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::{KeySlice, KeyVec};
@@ -319,6 +320,9 @@ impl LsmStorageInner {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let state_snapshot = Arc::clone(&self.state.read());
 
+        //////
+        // A: Try all in-memory memtables
+        //////
         // iterate over all memtable in order from newest to oldest
         for memtable in
             std::iter::once(&state_snapshot.memtable).chain(&state_snapshot.imm_memtables)
@@ -334,12 +338,18 @@ impl LsmStorageInner {
                 }
             }
         }
+        //////
+        // END OF A
+        //////
 
         let target_key = KeySlice::from_slice(key);
 
         // hash the key for probing the bloom filter
         let key_hash = farmhash::fingerprint32(target_key.raw_ref());
 
+        //////
+        // B: Try all l0 SSTs. L0 SSTs have overlapping ranges so we must generally probe multiple
+        //////
         for sst_id in &state_snapshot.l0_sstables {
             let sst = &state_snapshot.sstables[sst_id];
 
@@ -347,7 +357,7 @@ impl LsmStorageInner {
             if target_key >= sst.first_key().as_key_slice()
                 && target_key <= sst.last_key().as_key_slice()
                 // only check this sst if the key passes the bloom filter
-                && sst.bloom.as_ref().map_or(true, |bloom| {
+                && sst.bloom.as_ref().is_none_or(|bloom| {
                     bloom.may_contain(key_hash)
                 })
             {
@@ -364,6 +374,46 @@ impl LsmStorageInner {
                 }
             }
         }
+
+        //////
+        // END OF B
+        //////
+
+        //////
+        // C: Try all l1 SSTs. L1 is a sorted run of SSTs
+        //////
+
+        if let Some((level, sst_ids)) = state_snapshot.levels.get(0) {
+            // find the the sst whose range contains the target key
+            let sst_idx = sst_ids
+                .partition_point(|id| state_snapshot.sstables[id].last_key().raw_ref() < key);
+
+            // if sstd_idx is out of bounds, that means l0 does NOT contain target key
+            if sst_idx < sst_ids.len() {
+                // get the actual SST object
+                let sst = &state_snapshot.sstables[&sst_ids[sst_idx]];
+
+                // probe the Bloom filter for the target key. A negative result means the SST does not contain the key, and we can determine this without any IO read.
+                let may_contain_key = sst
+                    .bloom
+                    .as_ref()
+                    .is_none_or(|bloom| bloom.may_contain(key_hash));
+
+                if may_contain_key {
+                    let iter =
+                        SsTableIterator::create_and_seek_to_key(Arc::clone(sst), target_key)?;
+
+                    if iter.is_valid() && iter.key() == target_key {
+                        // key found. Return the value.
+                        return Ok(Some(Bytes::copy_from_slice(iter.value())));
+                    }
+                }
+            }
+        }
+
+        //////
+        // END OF C
+        //////
 
         // key not found in any memtable or sst
         Ok(None)
@@ -512,10 +562,16 @@ impl LsmStorageInner {
     ) -> Result<FusedIterator<LsmIterator>> {
         let snapshot = Arc::clone(&self.state.read());
 
+        //////
+        // A: Collect all in-memory memtables
+        //////
         let memtable_iters = std::iter::once(&snapshot.memtable)
             .chain(&snapshot.imm_memtables)
             .map(|mt| Box::new(mt.scan(lower, upper)))
             .collect();
+        //////
+        // END OF A
+        //////
 
         let start_key = match lower {
             Bound::Unbounded => KeyVec::new(),
@@ -529,6 +585,9 @@ impl LsmStorageInner {
             }
         };
 
+        //////
+        // B: Collect all L0 SSTs that overlap with the requested range
+        //////
         let mut sst_iters = vec![];
         for sst_id in &snapshot.l0_sstables {
             let sst = &snapshot.sstables[sst_id];
@@ -542,13 +601,38 @@ impl LsmStorageInner {
                 )?));
             }
         }
+        //////
+        // END OF B
+        //////
+
+        //////
+        // C: Collect all L1 SSTs
+        //////
+
+        let sstables = match snapshot.levels.get(0) {
+            Some((level, sst_ids)) => sst_ids
+                .iter()
+                .map(|id| Arc::clone(snapshot.sstables.get(id).unwrap()))
+                .collect(),
+            None => vec![],
+        };
+
+        let l1_iter =
+            SstConcatIterator::create_and_seek_to_key(sstables, start_key.as_key_slice())?;
+
+        //////
+        // END OF C
+        //////
 
         let memtable_merge_iter = MergeIterator::create(memtable_iters);
         let sst_merge_iter = MergeIterator::create(sst_iters);
 
         let upper_bound = upper.map(|x| Bytes::copy_from_slice(x));
         Ok(FusedIterator::new(LsmIterator::new(
-            TwoMergeIterator::create(memtable_merge_iter, sst_merge_iter)?,
+            TwoMergeIterator::create(
+                TwoMergeIterator::create(memtable_merge_iter, sst_merge_iter)?,
+                l1_iter,
+            )?,
             upper_bound,
         )?))
     }
