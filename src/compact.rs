@@ -133,7 +133,6 @@ impl LsmStorageInner {
         // get the SsTable instances
         // create a mergeiterator over all ssts
         // iterate over all of them, and build new ssts. Drop tombstones
-        // install the new levels
 
         let CompactionTask::ForceFullCompaction {
             l0_sstables,
@@ -197,31 +196,6 @@ impl LsmStorageInner {
             new_l1_sstables.push(Arc::new(sst));
         }
 
-        {
-            // lock the state for structural changes
-            let _state_guard = self.state_lock.lock();
-            let mut state = LsmStorageState::clone(&self.state.read());
-
-            // remove all l0 table ids that this compaction function moved out of l0. Keep the l0 table ids that were added to l0 since this compaction function started.
-            state.l0_sstables.retain(|id| !l0_sstables.contains(id));
-
-            state.levels[0] = (1, new_l1_sstables.iter().map(|sst| sst.sst_id()).collect());
-
-            for id in l0_sstables.iter().chain(l1_sstables) {
-                state.sstables.remove(id);
-            }
-
-            for sst in &new_l1_sstables {
-                state.sstables.insert(sst.sst_id(), Arc::clone(sst));
-            }
-
-            *self.state.write() = Arc::new(state);
-        }
-
-        for id in l0_sstables.iter().chain(l1_sstables) {
-            std::fs::remove_file(self.path_of_sst(*id))?;
-        }
-
         Ok(new_l1_sstables)
     }
 
@@ -240,18 +214,56 @@ impl LsmStorageInner {
 
         // take a snapshot of the state
         // call compact
+        // apply the compaction result to the state
 
-        let state_snapshot = Arc::clone(&self.state.read());
+        // snapshot the state
+        let snapshot = Arc::clone(&self.state.read());
 
-        let task = CompactionTask::ForceFullCompaction {
-            l0_sstables: state_snapshot.l0_sstables.clone(),
-            l1_sstables: match state_snapshot.levels.get(0) {
-                Some((level, ids)) => ids.clone(),
-                None => Vec::new(),
-            },
+        let l1_sstables = match snapshot.levels.get(0) {
+            Some((level, ids)) => ids.clone(),
+            None => Vec::new(),
         };
 
-        self.compact(&task)?;
+        // clone l1 sstables one more time, because we need it later and the original variable won't be accessible anymore after it is moved
+        let l1_sstables_old = l1_sstables.clone();
+
+        let task = CompactionTask::ForceFullCompaction {
+            l0_sstables: snapshot.l0_sstables.clone(),
+            l1_sstables: l1_sstables,
+        };
+
+        let new_ssts = self.compact(&task)?;
+
+        {
+            // lock the state for structural changes
+            let _state_guard = self.state_lock.lock();
+            let mut state = LsmStorageState::clone(&self.state.read());
+
+            // remove all l0 table ids that this compaction function moved out of l0. Keep the l0 table ids that were added to l0 since this compaction function started.
+            state
+                .l0_sstables
+                .retain(|id| !snapshot.l0_sstables.contains(id));
+
+            // install the new L1
+            state.levels[0] = (1, new_ssts.iter().map(|sst| sst.sst_id()).collect());
+
+            // remove all SSTs that were compacted away
+            for id in snapshot.l0_sstables.iter().chain(&l1_sstables_old) {
+                state.sstables.remove(id);
+            }
+
+            // update hashmap with new SSTs
+            for sst in &new_ssts {
+                state.sstables.insert(sst.sst_id(), Arc::clone(sst));
+            }
+
+            *self.state.write() = Arc::new(state);
+        }
+
+        for id in snapshot.l0_sstables.iter().chain(&l1_sstables_old) {
+            std::fs::remove_file(self.path_of_sst(*id))?;
+        }
+
         Ok(())
     }
 
