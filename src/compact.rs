@@ -36,6 +36,7 @@ use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
@@ -134,38 +135,119 @@ impl LsmStorageInner {
         // create a mergeiterator over all ssts
         // iterate over all of them, and build new ssts. Drop tombstones
 
-        let CompactionTask::ForceFullCompaction {
-            l0_sstables,
-            l1_sstables,
-        } = task
-        else {
-            unimplemented!();
-        };
+        let snapshot = Arc::clone(&self.state.read());
 
-        let state_snapshot = Arc::clone(&self.state.read());
+        // Because L0 is not a sorted run unlike the lower levels, it must be iterated over using MergeIterator rather than the ConcatIterator that can handle L1 .. Ln. This means that any task that compacts L0 has differently typed iterators from any compaction task that compacts L1 .. Ln
 
-        // Create individual iterators over the SSTs of L0
-        let l0_sst_iters = l0_sstables
-            .iter()
-            .map(|id| {
-                SsTableIterator::create_and_seek_to_first(Arc::clone(&state_snapshot.sstables[id]))
-            })
-            .collect::<Result<Vec<SsTableIterator>>>()?;
+        // In Rust's strict typing system, any variable in the code must have a exactly 1 type. Variables that hold generic structs are no exception to this. They also have 1 type, due to monomorphization. Hence two variables, holding the same generic struct, each with a different generic type (eg Vec<u8> vs Vec<i32> ; both using generic struct Vec<T>) do NOT have the same type.
+        // The consequence of this is that we can't abstract over the two iterators, even though we use them in identical ways. Hence we can't apply DRY and need to repeat some code. This is because the type of the special iterator for L0 penetrates. i.e. any code using that special iterator is differently typed than code using the other iterator, and thus we need to both cases in separate branches until both branches converge again to identical types. In our case this happens on method return and no earlier.
 
-        // create the iterator that iterates over all of L0
-        let l0_iter = MergeIterator::create(l0_sst_iters.into_iter().map(Box::new).collect());
+        // Some more background on this language feature:
+        // The benefit of this strict typing is that it allows static dispatch. If instead you want dynamic dispatch, we can use Box<dyn Trait>. Variables typed like this are called 'Trait objects' in Rust. This can sometimes make code easier and reduce boilerplate, at the cost of chasing a heap pointer to the vtable at runtime any time a method is called on this type.
+        // These threads contain good discussions:
+        // https://www.reddit.com/r/rust/comments/1etyqtl/on_using_dynamic_dispatch/
+        // https://www.reddit.com/r/rust/comments/ta2cei/why_exactly_cant_you_always_do_static_dispatch_in
 
-        // create the iterator that iterates over all of L1
-        let l1_iter = SstConcatIterator::create_and_seek_to_first(
-            l1_sstables
-                .iter()
-                .map(|id| Arc::clone(&state_snapshot.sstables[id]))
-                .collect(),
-        )?;
+        match task {
+            CompactionTask::ForceFullCompaction {
+                l0_sstables,
+                l1_sstables,
+            } => {
+                // Create individual iterators over the SSTs of L0
+                let l0_sst_iters = l0_sstables
+                    .iter()
+                    .map(|id| {
+                        SsTableIterator::create_and_seek_to_first(Arc::clone(
+                            &snapshot.sstables[id],
+                        ))
+                    })
+                    .collect::<Result<Vec<SsTableIterator>>>()?;
 
-        // create the iterator that iterates over all of L0 and L1 combined
-        let mut iterator = TwoMergeIterator::create(l0_iter, l1_iter)?;
+                // create the iterator that iterates over all of L0
+                let l0_iter =
+                    MergeIterator::create(l0_sst_iters.into_iter().map(Box::new).collect());
 
+                // create the iterator that iterates over all of L1
+                let l1_iter = SstConcatIterator::create_and_seek_to_first(
+                    l1_sstables
+                        .iter()
+                        .map(|id| Arc::clone(&snapshot.sstables[id]))
+                        .collect(),
+                )?;
+
+                // create the iterator that iterates over all of L0 and L1 combined
+                let iter = TwoMergeIterator::create(l0_iter, l1_iter)?;
+
+                self.compact_from_iter(iter, task.compact_to_bottom_level())
+            }
+            CompactionTask::Simple(task_details) => {
+                match task_details.upper_level {
+                    // None means the upper level is L0
+                    None => {
+                        // Note: the code in this arm is virtually identical to the code in arm 'CompactionTask::ForceFullCompaction'
+
+                        let l0_sst_iters = task_details
+                            .upper_level_sst_ids
+                            .iter()
+                            .map(|id| {
+                                SsTableIterator::create_and_seek_to_first(Arc::clone(
+                                    &snapshot.sstables[id],
+                                ))
+                            })
+                            .collect::<Result<Vec<SsTableIterator>>>()?;
+
+                        // create the iterator that iterates over all of L0
+                        let l0_iter =
+                            MergeIterator::create(l0_sst_iters.into_iter().map(Box::new).collect());
+
+                        // create the iterator that iterates over all of L1
+                        let lower_iter = SstConcatIterator::create_and_seek_to_first(
+                            task_details
+                                .lower_level_sst_ids
+                                .iter()
+                                .map(|id| Arc::clone(&snapshot.sstables[id]))
+                                .collect(),
+                        )?;
+
+                        // create the iterator that iterates over all of L0 and L1 combined
+                        let iter = TwoMergeIterator::create(l0_iter, lower_iter)?;
+                        self.compact_from_iter(iter, task.compact_to_bottom_level())
+                    }
+                    // Some means the upper level is a level below L0.
+                    Some(lvl) => {
+                        // create the iterator that iterates over all of L1
+                        let upper_iter = SstConcatIterator::create_and_seek_to_first(
+                            task_details
+                                .upper_level_sst_ids
+                                .iter()
+                                .map(|id| Arc::clone(&snapshot.sstables[id]))
+                                .collect(),
+                        )?;
+
+                        // create the iterator that iterates over all of L1
+                        let lower_iter = SstConcatIterator::create_and_seek_to_first(
+                            task_details
+                                .lower_level_sst_ids
+                                .iter()
+                                .map(|id| Arc::clone(&snapshot.sstables[id]))
+                                .collect(),
+                        )?;
+
+                        // create the iterator that iterates over all of L0 and L1 combined
+                        let iter = TwoMergeIterator::create(upper_iter, lower_iter)?;
+                        self.compact_from_iter(iter, task.compact_to_bottom_level())
+                    }
+                }
+            }
+            _ => unimplemented!(),
+        }
+    }
+
+    fn compact_from_iter(
+        &self,
+        mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
+        compact_to_bottom_level: bool,
+    ) -> Result<Vec<Arc<SsTable>>> {
         let mut new_l1_sstables = Vec::new();
 
         let mut sst_builder = SsTableBuilder::new(self.options.block_size);
@@ -173,10 +255,10 @@ impl LsmStorageInner {
         // use this bool to track if the sst builder contains at least one (non-tombstone) value
         let mut sst_nonempty = false;
 
-        while iterator.is_valid() {
-            // drop tombstones
-            if !iterator.value().is_empty() {
-                sst_builder.add(iterator.key(), iterator.value());
+        while iter.is_valid() {
+            // Only drop tombstones when we are compacting to the bottom level. If we are compacting to any level higher than that, we must preserve tombstones. This is because a lower level could still contain a value for this deleted key, so if we drop the tombstone we resurrect a deleted value.
+            if !iter.value().is_empty() || !compact_to_bottom_level {
+                sst_builder.add(iter.key(), iter.value());
                 sst_nonempty = true;
             }
 
@@ -187,7 +269,7 @@ impl LsmStorageInner {
                 sst_nonempty = false;
             }
 
-            iterator.next()?;
+            iter.next()?;
         }
 
         if sst_nonempty {
@@ -268,7 +350,53 @@ impl LsmStorageInner {
     }
 
     fn trigger_compaction(&self) -> Result<()> {
-        unimplemented!()
+        let CompactionOptions::Simple(options) = &self.options.compaction_options else {
+            unimplemented!();
+        };
+
+        let controller =
+            CompactionController::Simple(SimpleLeveledCompactionController::new(options.clone()));
+
+        let Some(task) = controller.generate_compaction_task(&self.state.read()) else {
+            // no compaction needed if this method returns None
+            return Ok(());
+        };
+
+        let new_ssts = self.compact(&task)?;
+
+        let ssts_to_remove = {
+            // lock for structural changes to the state
+            let _state_guard = self.state_lock.lock();
+
+            let snapshot = Arc::clone(&self.state.read());
+
+            let new_sst_ids: Vec<usize> = new_ssts.iter().map(|sst| sst.sst_id()).collect();
+
+            // apply_compaction_result does NOT update the hashmap. This is a slightly odd design, but that's how it works. apply_compaction_result updates state.l0_sstables and state.levels, but updating the hashmap state.sstables remains the responsibility of this method.
+            let (mut new_state, ssts_to_remove) =
+                controller.apply_compaction_result(&snapshot, &task, &new_sst_ids, false);
+
+            // remove old SSTs from the hashmap
+            for id in &ssts_to_remove {
+                new_state.sstables.remove(id);
+            }
+
+            // add new SSTs to the hashmap
+            for sst in new_ssts {
+                new_state.sstables.insert(sst.sst_id(), sst);
+            }
+
+            // install the new state
+            *self.state.write() = Arc::new(new_state);
+            ssts_to_remove
+        };
+
+        // delete old ssts from disk
+        for id in ssts_to_remove {
+            std::fs::remove_file(self.path_of_sst(id))?;
+        }
+
+        Ok(())
     }
 
     pub(crate) fn spawn_compaction_thread(
