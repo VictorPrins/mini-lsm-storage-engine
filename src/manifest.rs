@@ -15,9 +15,10 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::fs::File;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+use std::{fs::File, io::Read};
 
 use anyhow::Result;
 use parking_lot::{Mutex, MutexGuard};
@@ -37,12 +38,36 @@ pub enum ManifestRecord {
 }
 
 impl Manifest {
-    pub fn create(_path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        // open the file in append mode, so that any write is appended instead of overwriting file contents
+        let file = File::options()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(path)?;
+        Ok(Self {
+            file: Arc::new(Mutex::new(file)),
+        })
     }
 
-    pub fn recover(_path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
-        unimplemented!()
+    pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
+        let mut file = File::options().read(true).append(true).open(path)?;
+        let mut file_contents = vec![];
+        file.read_to_end(&mut file_contents)?;
+
+        let deser = serde_json::Deserializer::from_slice(&file_contents);
+        let mut records = vec![];
+
+        for record in deser.into_iter::<ManifestRecord>() {
+            records.push(record?);
+        }
+
+        Ok((
+            Self {
+                file: Arc::new(Mutex::new(file)),
+            },
+            records,
+        ))
     }
 
     pub fn add_record(
@@ -53,7 +78,14 @@ impl Manifest {
         self.add_record_when_init(record)
     }
 
-    pub fn add_record_when_init(&self, _record: ManifestRecord) -> Result<()> {
-        unimplemented!()
+    pub fn add_record_when_init(&self, record: ManifestRecord) -> Result<()> {
+        let mut file_guard = self.file.lock();
+
+        file_guard.write_all(&serde_json::to_vec(&record)?)?;
+
+        // fsync to disk
+        file_guard.sync_all()?;
+
+        Ok(())
     }
 }
