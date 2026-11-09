@@ -380,15 +380,15 @@ impl LsmStorageInner {
         //////
 
         //////
-        // C: Try all l1 SSTs. L1 is a sorted run of SSTs
+        // C: Try all L1..Ln SSTs. Each level is a sorted (non-overlapping) run of SSTs
         //////
 
-        if let Some((level, sst_ids)) = state_snapshot.levels.get(0) {
+        for (level, sst_ids) in &state_snapshot.levels {
             // find the the sst whose range contains the target key
             let sst_idx = sst_ids
                 .partition_point(|id| state_snapshot.sstables[id].last_key().raw_ref() < key);
 
-            // if sstd_idx is out of bounds, that means l0 does NOT contain target key
+            // if sstd_idx is out of bounds, that means this level does NOT contain target key
             if sst_idx < sst_ids.len() {
                 // get the actual SST object
                 let sst = &state_snapshot.sstables[&sst_ids[sst_idx]];
@@ -404,8 +404,13 @@ impl LsmStorageInner {
                         SsTableIterator::create_and_seek_to_key(Arc::clone(sst), target_key)?;
 
                     if iter.is_valid() && iter.key() == target_key {
-                        // key found. Return the value.
-                        return Ok(Some(Bytes::copy_from_slice(iter.value())));
+                        if iter.value().is_empty() {
+                            // The value is a deletion tombstone
+                            return Ok(None);
+                        } else {
+                            // key found. Return the value.
+                            return Ok(Some(Bytes::copy_from_slice(iter.value())));
+                        }
                     }
                 }
             }
@@ -606,20 +611,22 @@ impl LsmStorageInner {
         //////
 
         //////
-        // C: Collect all L1 SSTs
+        // C: Collect all L1..Ln SSTs
         //////
 
-        let sstables = match snapshot.levels.get(0) {
-            Some((level, sst_ids)) => sst_ids
+        let mut concat_iters = vec![];
+
+        for (level, sst_ids) in &snapshot.levels {
+            let sstables = sst_ids
                 .iter()
                 .map(|id| Arc::clone(snapshot.sstables.get(id).unwrap()))
-                .collect(),
-            None => vec![],
-        };
+                .collect();
 
-        let l1_iter =
-            SstConcatIterator::create_and_seek_to_key(sstables, start_key.as_key_slice())?;
-
+            concat_iters.push(Box::new(SstConcatIterator::create_and_seek_to_key(
+                sstables,
+                start_key.as_key_slice(),
+            )?));
+        }
         //////
         // END OF C
         //////
@@ -631,7 +638,7 @@ impl LsmStorageInner {
         Ok(FusedIterator::new(LsmIterator::new(
             TwoMergeIterator::create(
                 TwoMergeIterator::create(memtable_merge_iter, sst_merge_iter)?,
-                l1_iter,
+                MergeIterator::create(concat_iters),
             )?,
             upper_bound,
         )?))

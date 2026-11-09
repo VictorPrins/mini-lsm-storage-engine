@@ -31,8 +31,10 @@ use crate::{
 
 /// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
 type LsmIteratorInner = TwoMergeIterator<
+    // Iterator for all in-memory Memtables.          // Iterator for all L0 SSTs (with overlapping ranges)
     TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>,
-    SstConcatIterator,
+    // Iterator for L1 .. Ln, which are non-overlapping sorted runs
+    MergeIterator<SstConcatIterator>,
 >;
 
 pub struct LsmIterator {
